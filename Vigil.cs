@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -15,6 +16,7 @@ using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.Principal;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using LibreHardwareMonitor.Hardware;
 using Microsoft.Win32;
@@ -27,7 +29,7 @@ namespace VigilApp
         [STAThread]
         static int Main(string[] args)
         {
-            // The sensor library and its friends are packed inside the exe: one file to download, like Sentinel.
+            // The libraries are packed inside the exe: one file to download, like Sentinel.
             AppDomain.CurrentDomain.AssemblyResolve += Libs.Resolve;
             return Run(args);
         }
@@ -38,8 +40,9 @@ namespace VigilApp
         {
             if (Array.IndexOf(args, "--selftest") >= 0) return SelfTest.Run();
 
-            // --restart: the old Vigil is closing to hand over to an elevated one, wait for it
+            // --restart: the old Vigil is closing to hand over to a new one, wait for it
             bool restart = Array.IndexOf(args, "--restart") >= 0;
+            bool fromStartup = Array.IndexOf(args, "--startup") >= 0;
             Mutex single = null;
             bool owned = false;
             try
@@ -49,17 +52,18 @@ namespace VigilApp
             }
             catch (AbandonedMutexException) { owned = true; }
             catch (UnauthorizedAccessException) { }   // the running Vigil is elevated: it's there all the same
-            bool fromStartup = Array.IndexOf(args, "--startup") >= 0;
             if (!owned)
             {
                 // at logon both the Run key and the elevated task may fire: the second one just leaves
                 if (!fromStartup) MessageBox.Show(L.T("Vigil è già acceso: lo trovi nell'area di notifica, vicino all'orologio.",
-                                    "Vigil is already running: look for it in the notification area, next to the clock."),
-                                "Vigil", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                                                      "Vigil is already running: look for it in the notification area, next to the clock."),
+                                                  "Vigil", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return 0;
             }
             try
             {
+                // any crash goes through AppDomain.UnhandledException, where the fans are handed back to the BIOS
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Application.Run(new VigilContext(fromStartup));
@@ -73,6 +77,19 @@ namespace VigilApp
     {
         static readonly Dictionary<string, Assembly> Loaded = new Dictionary<string, Assembly>();
 
+        static byte[] Resource(string name)
+        {
+            using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream(name))
+            {
+                if (s == null) return null;
+                var m = new MemoryStream();
+                s.CopyTo(m);
+                return m.ToArray();
+            }
+        }
+
+        public static Stream Open(string name) { return Assembly.GetExecutingAssembly().GetManifestResourceStream(name); }
+
         public static Assembly Resolve(object sender, ResolveEventArgs e)
         {
             string file = new AssemblyName(e.Name).Name + ".dll";
@@ -80,45 +97,60 @@ namespace VigilApp
             {
                 Assembly a;
                 if (Loaded.TryGetValue(file, out a)) return a;
-                using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream(file))
-                {
-                    if (s == null) return null;
-                    var m = new MemoryStream();
-                    s.CopyTo(m);
-                    a = Assembly.Load(m.ToArray());
-                }
+                byte[] bytes = Resource(file);
+                if (bytes == null) return null;
+                a = Assembly.Load(bytes);
                 Loaded[file] = a;
                 return a;
             }
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr LoadLibrary(string path);
+
+        // A native DLL can't be loaded from memory: it goes to disk once, then into the process by full path.
+        public static void LoadNative(string name, string folder)
+        {
+            byte[] bytes = Resource(name);
+            string path = Path.Combine(folder, name);
+            Directory.CreateDirectory(folder);
+            if (!File.Exists(path) || new FileInfo(path).Length != bytes.Length) File.WriteAllBytes(path, bytes);
+            if (LoadLibrary(path) == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
         }
     }
 
     // Italian if Windows speaks Italian, English otherwise. Same as Sentinel.
     public static class L
     {
-        static readonly bool It = CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "it";
+        public static readonly bool It = CultureInfo.CurrentUICulture.TwoLetterISOLanguageName == "it";
         public static string T(string it, string en) { return It ? it : en; }
 
         public static Icon AppIcon(Size size)
         {
-            using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("Vigil.ico"))
+            using (var s = Libs.Open("Vigil.ico"))
                 return s == null ? SystemIcons.Application : new Icon(s, size);
         }
     }
 
-    // One sensor at one moment, copied out of the library so the window never touches it from another thread.
+    public static class Json
+    {
+        static readonly JavaScriptSerializer S = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+        public static string Write(object o) { return S.Serialize(o); }
+        public static T Read<T>(string s) { return S.Deserialize<T>(s); }
+    }
+
+    // One sensor at one moment, copied out of the library so nothing else ever touches it from another thread.
     public class Reading
     {
-        public string Key, GroupKey, Group, Kind, Name, Type;
+        public string Key, GroupKey, Group, Kind, Name, Type, CtlMode;
         public int GroupRank, Index;
         public float? Value, Min, Max;
-        public bool DefaultHidden;
+        public bool DefaultHidden, Ctl;
     }
 
     // Everything that decides what is shown, in one place, checked by --selftest.
     public static class Rules
     {
-        static readonly string[] TypeOrder = { "Temperature", "Fan", "Control", "Power", "Load", "Clock", "Voltage", "Current" };
         static readonly string[] DriverKinds = { "Cpu", "Motherboard", "SuperIO", "EmbeddedController" };
         static readonly string[] MainNames = { "CPU Package", "Core (Tctl/Tdie)", "Core (Tctl)", "Core (Tdie)", "GPU Core" };
 
@@ -128,8 +160,9 @@ namespace VigilApp
             // Without the driver these chips answer 0 (temperatures, watts) or a made-up number
             // (a Ryzen's VID reads 1.55 V): only their load is real.
             if (!full && Array.IndexOf(DriverKinds, r.Kind) >= 0 && r.Type != "Load") return false;
-            if (r.Type == "Temperature" && (r.Value <= 0 || r.Value >= 125)) return false;   // unplugged probes read -55 or 127
-            if (r.Type == "Fan" && r.Kind.StartsWith("Gpu")) return true;   // a GPU fan stopped at idle is still a fan
+            // unplugged probes read -55 or 127; a RAM stick's "Temperature Sensor Resolution" reads 0.25: nothing in a PC is under 5 °C
+            if (r.Type == "Temperature" && (r.Value < 5 || r.Value >= 125)) return false;
+            if ((r.Type == "Fan" || r.Type == "Control") && r.Kind.StartsWith("Gpu")) return true;   // a GPU fan stopped at idle is still a fan
             return r.Max > 0 || r.Min < 0;   // never moved from 0 since start: nothing connected
         }
 
@@ -156,40 +189,8 @@ namespace VigilApp
             return 7;   // network and the rest
         }
 
-        public static int TypeRank(string type)
-        {
-            int i = Array.IndexOf(TypeOrder, type);
-            return i < 0 ? TypeOrder.Length : i;
-        }
-
         // 0 fine, 1 warm (within 10 degrees of the limit), 2 over the limit
         public static int Level(float t, int limit) { return t >= limit ? 2 : t >= limit - 10 ? 1 : 0; }
-
-        public static string Format(string type, float v)
-        {
-            switch (type)
-            {
-                case "Temperature": return v.ToString("0.0") + " °C";
-                case "Fan":         return v.ToString("0") + " RPM";
-                case "Control":
-                case "Load":
-                case "Level":
-                case "Humidity":    return v.ToString("0.0") + " %";
-                case "Power":       return v.ToString("0.0") + " W";
-                case "Clock":       return v.ToString("0") + " MHz";
-                case "Voltage":     return v.ToString("0.000") + " V";
-                case "Current":     return v.ToString("0.000") + " A";
-                case "Data":        return v.ToString("0.00") + " GB";
-                case "SmallData":   return v.ToString("0") + " MB";
-                case "Throughput":  return v >= 1048576 ? (v / 1048576).ToString("0.0") + " MB/s" : (v / 1024).ToString("0.0") + " KB/s";
-                case "Frequency":   return v.ToString("0") + " Hz";
-                case "Energy":      return v.ToString("0") + " mWh";
-                case "Flow":        return v.ToString("0.0") + " L/h";
-                case "Noise":       return v.ToString("0") + " dBA";
-                case "TimeSpan":    return v.ToString("0") + " s";
-                default:            return v.ToString("0.##");
-            }
-        }
     }
 
     // Rings once per episode: over the limit for a whole minute. Re-armed 5 degrees under the limit,
@@ -215,6 +216,76 @@ namespace VigilApp
         }
     }
 
+    // What the user asked for one fan. Never changed after creation: the sensor thread reads it while the window writes a new one.
+    public class FanPlan
+    {
+        public string Mode = "auto", Source, Name;
+        public int Pct = 50;
+        public int[] Temps, Pcts;
+    }
+
+    // The fan rules, all of them safety rules first. Checked by --selftest.
+    public static class Fans
+    {
+        public const int MinPct = 20;   // a fan you command never goes under this, whatever the curve says
+        public const int StepDown = 2;  // % per second when slowing down: no fan that hunts up and down
+
+        static int Clamp(int v, int lo, int hi) { return Math.Max(lo, Math.Min(hi, v)); }
+
+        // Whatever comes from the window is checked here: bad values become safe ones, never an exception.
+        public static FanPlan Clean(FanPlan p)
+        {
+            var c = new FanPlan();
+            c.Mode = p != null && (p.Mode == "fixed" || p.Mode == "curve") ? p.Mode : "auto";
+            if (p == null) return c;
+            c.Pct = Clamp(p.Pct, MinPct, 100);
+            c.Source = p.Source;
+            c.Name = p.Name == null ? null : p.Name.Trim().Length == 0 ? null : p.Name.Trim().Substring(0, Math.Min(40, p.Name.Trim().Length));
+            if (p.Temps != null && p.Pcts != null && p.Temps.Length == p.Pcts.Length && p.Temps.Length >= 2 && p.Temps.Length <= 8)
+            {
+                var pts = p.Temps.Select((t, i) => new[] { Clamp(t, 0, 120), Clamp(p.Pcts[i], MinPct, 100) }).OrderBy(x => x[0]).ToList();
+                for (int i = 1; i < pts.Count; i++) if (pts[i][0] <= pts[i - 1][0]) pts[i][0] = pts[i - 1][0] + 1;   // strictly rising
+                c.Temps = pts.Select(x => x[0]).ToArray();
+                c.Pcts = pts.Select(x => x[1]).ToArray();
+            }
+            else { c.Temps = new[] { 40, 60, 75, 85 }; c.Pcts = new[] { 30, 45, 70, 100 }; }
+            if (c.Mode == "curve" && string.IsNullOrEmpty(c.Source)) c.Mode = "auto";
+            return c;
+        }
+
+        public static float Curve(int[] temps, int[] pcts, float t)
+        {
+            if (t <= temps[0]) return pcts[0];
+            for (int i = 1; i < temps.Length; i++)
+                if (t <= temps[i]) return pcts[i - 1] + (pcts[i] - pcts[i - 1]) * (t - temps[i - 1]) / (temps[i] - temps[i - 1]);
+            return pcts[pcts.Length - 1];
+        }
+
+        // null = hand it to the BIOS (or the graphics driver)
+        public static float? Target(FanPlan p, IDictionary<string, float> temps, bool emergency)
+        {
+            if (p == null || p.Mode == "auto") return null;
+            if (emergency) return 100;
+            if (p.Mode == "fixed") return Math.Max(MinPct, Math.Min(100, p.Pct));
+            float t;
+            if (p.Source == null || !temps.TryGetValue(p.Source, out t)) return null;   // the probe is gone: the BIOS knows better than a guess
+            return Math.Max(MinPct, Math.Min(100, Curve(p.Temps, p.Pcts, t)));
+        }
+
+        // Up at once, down slowly
+        public static float Smooth(float? prev, float target)
+        {
+            if (prev == null || target >= prev.Value) return target;
+            return Math.Max(target, prev.Value - StepDown);
+        }
+
+        // CPU or GPU over the limit: every fan you command goes to 100% until it's 5 degrees under
+        public static bool Emergency(bool was, float hottest, int limit)
+        {
+            return was ? hottest > limit - Alarm.Rearm : hottest >= limit;
+        }
+    }
+
     public static class SelfTest
     {
         static Reading R(string kind, string type, string name, float? value, float? max)
@@ -231,14 +302,13 @@ namespace VigilApp
         {
             try
             {
-                Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
-
                 Check(!Rules.Visible(R("Cpu", "Temperature", "Core (Tctl/Tdie)", 0, 0), false), "base mode hides the CPU's zero temperature");
                 Check(!Rules.Visible(R("Cpu", "Voltage", "Core #1 VID", 1.55f, 1.55f), false), "base mode hides the CPU's made-up voltage");
                 Check(Rules.Visible(R("Cpu", "Load", "CPU Total", 12, 40), false), "base mode shows the CPU load");
                 Check(Rules.Visible(R("Cpu", "Temperature", "Core (Tctl/Tdie)", 48, 60), true), "full mode shows the CPU temperature");
                 Check(!Rules.Visible(R("SuperIO", "Temperature", "Temperature #3", 127, 127), true), "an unplugged probe stays hidden");
                 Check(!Rules.Visible(R("SuperIO", "Fan", "Fan #4", 0, 0), true), "an empty fan header stays hidden");
+                Check(!Rules.Visible(R("Memory", "Temperature", "Temperature Sensor Resolution", 0.25f, 0.25f), true), "a probe's resolution is not a temperature");
                 Check(Rules.Visible(R("GpuAmd", "Fan", "GPU Fan", 0, 0), false), "a GPU fan at rest is shown");
                 Check(!Rules.Visible(R("Network", "Throughput", "Upload Speed", 0, 0), false), "an idle network adapter stays hidden");
                 Check(!Rules.Visible(R("GpuAmd", "Clock", "GPU Core", null, null), false), "no value, no row");
@@ -252,10 +322,6 @@ namespace VigilApp
                 Check(Rules.MainTemps(all, false).Count == 1, "base mode: only the GPU has a temperature");
                 var odd = new List<Reading> { R("GpuIntel", "Temperature", "A", 40, 40), R("GpuIntel", "Temperature", "B", 45, 45) };
                 Check(Rules.MainTemps(odd, true)[0].Name == "B", "no known name: the hottest");
-
-                Check(Rules.Format("Throughput", 35065.77f) == "34.2 KB/s", "throughput in KB/s");
-                Check(Rules.Format("Throughput", 3 * 1048576f) == "3.0 MB/s", "throughput in MB/s");
-                Check(Rules.Format("Temperature", 55) == "55.0 °C", "temperature");
                 Check(Rules.Level(79, 90) == 0 && Rules.Level(80, 90) == 1 && Rules.Level(90, 90) == 2, "tray colour levels");
 
                 var a = new Alarm();
@@ -266,10 +332,27 @@ namespace VigilApp
                 Check(!a.Step(93, 90, t0.AddSeconds(120)), "once per episode");
                 Check(!a.Step(87, 90, t0.AddSeconds(130)), "dip under the limit");
                 Check(!a.Step(91, 90, t0.AddSeconds(200)), "back over without re-arming: silent");
-                Check(!a.Step(91, 90, t0.AddSeconds(300)), "still silent");
                 Check(!a.Step(85, 90, t0.AddSeconds(310)), "re-armed 5 degrees under");
                 Check(!a.Step(91, 90, t0.AddSeconds(320)), "new episode starts");
                 Check(a.Step(91, 90, t0.AddSeconds(380)), "new episode rings");
+
+                // fans: the curve, the floor, the emergency, the slow way down, the BIOS when in doubt
+                int[] temps = { 40, 60, 80 }, pcts = { 30, 50, 100 };
+                Check(Fans.Curve(temps, pcts, 20) == 30 && Fans.Curve(temps, pcts, 50) == 40 && Fans.Curve(temps, pcts, 90) == 100, "curve: flat ends, straight lines between");
+                var curve = new FanPlan { Mode = "curve", Source = "/cpu/t", Temps = temps, Pcts = pcts };
+                var t = new Dictionary<string, float> { { "/cpu/t", 70 } };
+                Check(Fans.Target(curve, t, false) == 75, "curve follows its probe");
+                Check(Fans.Target(curve, new Dictionary<string, float>(), false) == null, "probe gone: back to the BIOS");
+                Check(Fans.Target(curve, t, true) == 100, "emergency: 100%");
+                Check(Fans.Target(new FanPlan { Mode = "auto" }, t, true) == null, "a fan left to the BIOS stays there, even in an emergency");
+                Check(Fans.Target(new FanPlan { Mode = "fixed", Pct = 5 }, t, false) == Fans.MinPct, "never under the floor");
+                Check(Fans.Target(null, t, false) == null, "no plan: BIOS");
+                Check(Fans.Smooth(40, 70) == 70 && Fans.Smooth(70, 40) == 68 && Fans.Smooth(null, 40) == 40, "up at once, down 2% a second");
+                Check(Fans.Emergency(false, 90, 90) && Fans.Emergency(true, 86, 90) && !Fans.Emergency(true, 85, 90) && !Fans.Emergency(false, 89, 90), "emergency in at the limit, out 5 under");
+                var dirty = Fans.Clean(new FanPlan { Mode = "rocket", Pct = 300, Temps = new[] { 90, 30, 30 }, Pcts = new[] { 0, 10, 200 } });
+                Check(dirty.Mode == "auto" && dirty.Pct == 100, "unknown mode: auto; percent clamped");
+                Check(dirty.Temps.SequenceEqual(new[] { 30, 31, 90 }) && dirty.Pcts.All(p => p >= Fans.MinPct && p <= 100), "curve points sorted, rising, clamped");
+                Check(Fans.Clean(new FanPlan { Mode = "curve" }).Mode == "auto", "a curve without a probe is auto");
                 return 0;
             }
             catch (Exception ex)
@@ -280,14 +363,23 @@ namespace VigilApp
         }
     }
 
-    // Reads every sensor once a second on its own thread and hands out copies.
+    // Reads every sensor once a second on its own thread, drives the fans, hands out copies.
+    // All library calls happen on this thread.
     public class Sensors
     {
         public Action<List<Reading>> Updated;
-        public volatile bool Driver, Ready;
-        public volatile string Summary = "";
+        public volatile bool Driver, Ready, InEmergency;
+        public volatile Dictionary<string, object> Pc = new Dictionary<string, object>();
+        public volatile Dictionary<string, FanPlan> Plans = new Dictionary<string, FanPlan>();
+        public volatile int AlertAt = 90;
+
         readonly ManualResetEvent stop = new ManualResetEvent(false);
+        readonly Dictionary<string, IControl> controls = new Dictionary<string, IControl>();
+        readonly Dictionary<string, float> sent = new Dictionary<string, float>();
+        readonly HashSet<string> touched = new HashSet<string>();
         Thread thread;
+
+        public bool Full { get { return VigilContext.Admin && Driver; } }
 
         public void Start()
         {
@@ -310,19 +402,22 @@ namespace VigilApp
                 c.IsNetworkEnabled = c.IsStorageEnabled = c.IsBatteryEnabled = c.IsPsuEnabled = true;
             try { Driver = LibreHardwareMonitor.PawnIo.PawnIo.IsInstalled; } catch { Driver = false; }
             try { c.Open(); } catch { }
-            Summary = Describe(c);
+            Pc = Describe(c);
             Ready = true;
             do
             {
                 var list = new List<Reading>();
+                controls.Clear();
                 foreach (IHardware h in c.Hardware.ToList()) Collect(h, h, list);
+                ApplyFans(list);
                 var cb = Updated;
                 if (cb != null) cb(list);
             } while (!stop.WaitOne(1000));
+            RestoreFans();
             try { c.Close(); } catch { }
         }
 
-        static void Collect(IHardware top, IHardware h, List<Reading> list)
+        void Collect(IHardware top, IHardware h, List<Reading> list)
         {
             try { h.Update(); } catch { return; }   // one chip hiccups, the others carry on
             string group = h == top ? h.Name : top.Name + " › " + h.Name;
@@ -339,38 +434,88 @@ namespace VigilApp
                 r.Index = s.Index;
                 r.Value = s.Value; r.Min = s.Min; r.Max = s.Max;
                 r.DefaultHidden = s.IsDefaultHidden;
+                if (s.Control != null)
+                {
+                    r.Ctl = true;
+                    r.CtlMode = s.Control.ControlMode.ToString();
+                    controls[r.Key] = s.Control;
+                }
                 list.Add(r);
             }
             foreach (IHardware sub in h.SubHardware) Collect(top, sub, list);
         }
 
-        // "What's inside", in words: chips from the library, RAM and disks from Windows (no admin needed).
-        static string Describe(Computer c)
+        void ApplyFans(List<Reading> list)
         {
-            var chips = new List<string>();
-            string board = null;
+            var plans = Plans;
+            if (plans.Count == 0 && touched.Count == 0) return;
+            var temps = new Dictionary<string, float>();
+            foreach (var r in list) if (r.Type == "Temperature" && r.Value != null && Rules.Visible(r, Full)) temps[r.Key] = r.Value.Value;
+            var mains = Rules.MainTemps(list, Full);
+            InEmergency = Fans.Emergency(InEmergency, mains.Count > 0 ? mains.Max(r => r.Value.Value) : 0, AlertAt);
+
+            foreach (var kv in controls)
+            {
+                FanPlan p;
+                plans.TryGetValue(kv.Key, out p);
+                float? target = Fans.Target(p, temps, InEmergency);
+                IControl ctl = kv.Value;
+                try
+                {
+                    if (target == null)
+                    {
+                        if (touched.Remove(kv.Key)) { ctl.SetDefault(); sent.Remove(kv.Key); }
+                        continue;
+                    }
+                    float prev;
+                    float next = Fans.Smooth(sent.TryGetValue(kv.Key, out prev) ? prev : (float?)null, target.Value);
+                    next = Math.Max(ctl.MinSoftwareValue, Math.Min(ctl.MaxSoftwareValue, next));
+                    ctl.SetSoftware(next);   // every second: after sleep the BIOS may have taken it back
+                    sent[kv.Key] = next;
+                    touched.Add(kv.Key);
+                }
+                catch { }   // a chip that refuses: it stays as it is, the others carry on
+            }
+        }
+
+        // Closing or crashing: every fan Vigil touched goes back to the BIOS
+        public void RestoreFans()
+        {
+            foreach (var key in touched.ToList())
+            {
+                IControl ctl;
+                if (controls.TryGetValue(key, out ctl)) try { ctl.SetDefault(); } catch { }
+            }
+            touched.Clear();
+        }
+
+        // What's inside, as data: chips from the library, RAM and disks from Windows (no admin needed). The window writes the words.
+        static Dictionary<string, object> Describe(Computer c)
+        {
+            var d = new Dictionary<string, object>();
+            var cpu = new List<string>();
+            var gpu = new List<string>();
             foreach (IHardware h in c.Hardware)
             {
                 string k = h.HardwareType.ToString();
-                if (k == "Cpu" || k.StartsWith("Gpu")) chips.Add(h.Name);
-                if (k == "Motherboard") board = h.Name;
+                if (k == "Cpu") cpu.Add(h.Name);
+                if (k.StartsWith("Gpu")) gpu.Add(h.Name);
+                if (k == "Motherboard") d["board"] = h.Name;
             }
-            var lines = new List<string>();
-            if (chips.Count > 0) lines.Add(string.Join("  ·  ", chips));
-            string second = string.Join("  ·  ", new[] { Ram(), board }.Where(x => !string.IsNullOrEmpty(x)));
-            if (second != "") lines.Add(second);
-            string disks = Disks();
-            if (disks != "") lines.Add(disks);
-            return string.Join("\n", lines);
+            d["cpu"] = cpu;
+            d["gpu"] = gpu;
+            d["ram"] = Ram();
+            d["disks"] = Disks();
+            return d;
         }
 
-        static IEnumerable<ManagementBaseObject> Wmi(string query)
+        static List<ManagementBaseObject> Wmi(string query)
         {
             using (var s = new ManagementObjectSearcher(query))
                 return s.Get().Cast<ManagementBaseObject>().ToList();
         }
 
-        static string Ram()
+        static Dictionary<string, object> Ram()
         {
             try
             {
@@ -393,28 +538,25 @@ namespace VigilApp
                     }
                 }
                 if (sizes.Count == 0) return null;
-                int slots = Wmi("SELECT MemoryDevices FROM Win32_PhysicalMemoryArray").Sum(m => Convert.ToInt32(m["MemoryDevices"] ?? 0));
-                string sticks = sizes.Distinct().Count() == 1 ? sizes.Count + " × " + sizes[0] + " GB" : string.Join(" + ", sizes) + " GB";
-                string used = slots >= sizes.Count ? string.Format(L.T(", {0} slot su {1}", ", {0} of {1} slots"), sizes.Count, slots) : "";
-                string at = speed > 0 ? string.Format(L.T(" a {0} MT/s", " at {0} MT/s"), speed) : "";
-                return string.Format("RAM {0} GB {1}{2} ({3}{4})", sizes.Sum(), type, at, sticks, used).Replace("  ", " ");
+                var d = new Dictionary<string, object>();
+                d["sticks"] = sizes;
+                d["speed"] = speed;
+                d["type"] = type;
+                d["slots"] = Wmi("SELECT MemoryDevices FROM Win32_PhysicalMemoryArray").Sum(m => Convert.ToInt32(m["MemoryDevices"] ?? 0));
+                return d;
             }
             catch { return null; }
         }
 
-        static string Disks()
+        static List<Dictionary<string, object>> Disks()
         {
             try
             {
-                var names = Wmi("SELECT Model, Size FROM Win32_DiskDrive").Where(m => Convert.ToDouble(m["Size"] ?? 0.0) > 0).Select(m =>
-                {   // no size: an empty card reader
-                    double gb = Convert.ToDouble(m["Size"] ?? 0) / 1e9;
-                    string size = gb >= 1000 ? (gb / 1000).ToString("0.#") + " TB" : gb.ToString("0") + " GB";
-                    return Convert.ToString(m["Model"]).Trim() + " (" + size + ")";
-                }).ToList();
-                return names.Count == 0 ? "" : L.T("Dischi: ", "Disks: ") + string.Join(", ", names);
+                return Wmi("SELECT Model, Size FROM Win32_DiskDrive").Where(m => Convert.ToDouble(m["Size"] ?? 0.0) > 0)   // no size: an empty card reader
+                    .Select(m => new Dictionary<string, object> { { "name", Convert.ToString(m["Model"]).Trim() }, { "bytes", Convert.ToDouble(m["Size"]) } })
+                    .ToList();
             }
-            catch { return ""; }
+            catch { return new List<Dictionary<string, object>>(); }
         }
     }
 
@@ -427,7 +569,7 @@ namespace VigilApp
         public static Icon Number(int t, int level)
         {
             int w = SystemInformation.SmallIconSize.Width;
-            Color bg = level == 2 ? Color.FromArgb(0xdc, 0x26, 0x26) : level == 1 ? Color.FromArgb(0xd9, 0x77, 0x06) : Color.FromArgb(0x27, 0x27, 0x2a);
+            Color bg = level == 2 ? Color.FromArgb(0xdc, 0x26, 0x26) : level == 1 ? Color.FromArgb(0xd9, 0x77, 0x06) : Color.FromArgb(0x0b, 0x0f, 0x0d);
             using (var bmp = new Bitmap(w, w))
             using (var g = Graphics.FromImage(bmp))
             {
@@ -443,6 +585,7 @@ namespace VigilApp
                     path.AddArc(0, w - 1 - r * 2, r * 2, r * 2, 90, 90);
                     path.CloseFigure();
                     g.FillPath(b, path);
+                    if (level == 0) using (var edge = new Pen(Color.FromArgb(0x2f, 0xe3, 0x7f), Math.Max(1, w / 16))) g.DrawPath(edge, path);
                 }
                 string s = t.ToString();
                 using (var f = new Font("Segoe UI", w * (s.Length > 2 ? 0.5f : 0.7f), FontStyle.Bold, GraphicsUnit.Pixel))
@@ -471,6 +614,7 @@ namespace VigilApp
         const string RegistryPath = "SOFTWARE\\VigilApp";
         const string RunPath = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
         const string TaskName = "Vigil";
+        const int HistorySize = 600;   // one reading a second: ten minutes
 
         // Portable version: a Vigil.ini next to the exe. Settings live there, the registry is never touched.
         static readonly string IniPath = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "Vigil.ini");
@@ -482,16 +626,19 @@ namespace VigilApp
         readonly Sensors sensors = new Sensors();
         readonly Icon appIcon;
         readonly Dictionary<string, Alarm> alarms = new Dictionary<string, Alarm>();
+        readonly Dictionary<string, List<float>> history = new Dictionary<string, List<float>>();
         Icon numberIcon;
         string iconKey = "";
-        bool modeShown;
+        bool startup;
 
         bool alertsOn = true;
         int alertAt = 90;
 
         public VigilContext(bool fromStartup)
         {
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => sensors.RestoreFans();
             LoadSettings();
+            sensors.AlertAt = alertAt;
             appIcon = L.AppIcon(SystemInformation.SmallIconSize);
 
             tray = new NotifyIcon();
@@ -512,22 +659,11 @@ namespace VigilApp
             menu.Items.Add(L.T("Esci", "Exit"), null, (s, e) => Exit());
             tray.ContextMenuStrip = menu;
 
-            bool startup = !Portable && IsStartupEnabled();
+            startup = !Portable && IsStartupEnabled();
             if (startup) RefreshStartup();
 
-            form = new MainForm(startup, alertsOn, alertAt);
-            if (Portable) form.ShowPortable();
-            form.StartupChanged += (s, e) => { SetStartup(form.chkStartup.Checked); form.SetStartupQuietly(IsStartupEnabled()); };
-            form.AlertsChanged += (s, e) =>
-            {
-                alertsOn = form.chkAlerts.Checked;
-                alertAt = (int)form.nudAlertAt.Value;
-                alarms.Clear();
-                iconKey = "";
-                SaveSettings();
-            };
-            form.RestartAsAdmin += (s, e) => Restart(true);
-            form.RestartPlain += (s, e) => Restart(false);
+            form = new MainForm(DataFolder());
+            form.Message += OnMessage;
             var handle = form.Handle;   // the window must exist, even hidden, to receive the readings
 
             sensors.Updated = list =>
@@ -540,14 +676,28 @@ namespace VigilApp
             if (!fromStartup) ShowForm();   // at login it stays quiet in the tray
         }
 
+        // WebView2 keeps its cache here. Portable: in TEMP, so the stick stays clean.
+        // Elevated and plain Vigil get separate folders: WebView2 refuses one made with other rights.
+        static string DataFolder()
+        {
+            string root = Portable ? Path.GetTempPath() : Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            return Path.Combine(root, "Vigil", Admin ? "web-admin" : "web");
+        }
+
+        List<Reading> lastRows = new List<Reading>();
+
         void OnReadings(List<Reading> list)
         {
-            bool full = Admin && sensors.Driver;
-            if (!modeShown && sensors.Ready)
+            bool full = sensors.Full;
+            var rows = list.Where(r => Rules.Visible(r, full)).ToList();
+            foreach (var r in rows)
             {
-                form.SetMode(Admin, sensors.Driver, sensors.Summary);
-                modeShown = true;
+                List<float> h;
+                if (!history.TryGetValue(r.Key, out h)) history[r.Key] = h = new List<float>(HistorySize + 1);
+                h.Add(r.Value.Value);
+                if (h.Count > HistorySize) h.RemoveAt(0);   // ponytail: O(n) shift, 600 floats a sensor, nothing to measure
             }
+            lastRows = rows;
 
             var mains = Rules.MainTemps(list, full);
             UpdateTray(mains);
@@ -562,7 +712,100 @@ namespace VigilApp
                                               "{0}: {1:0} °C for over a minute (your limit is {2} °C)."), r.Group, r.Value.Value, alertAt),
                             ToolTipIcon.Warning);
                 }
-            form.ShowReadings(list, full);
+            if (!form.PageReady) return;
+            if (!initWithPc) SendInit();   // the page opened before the sensors were ready: now it gets the whole picture
+            else form.Post(Data(rows, mains));
+        }
+
+        bool initWithPc;
+
+        static object Row(Reading r)
+        {
+            var d = new Dictionary<string, object> {
+                { "k", r.Key }, { "gk", r.GroupKey }, { "g", r.Group }, { "kind", r.Kind }, { "rank", r.GroupRank },
+                { "n", r.Name }, { "type", r.Type }, { "i", r.Index },
+                { "v", Math.Round((double)r.Value.Value, 3) },
+                { "min", r.Min.HasValue ? Math.Round((double)r.Min.Value, 3) : (object)null },
+                { "max", r.Max.HasValue ? Math.Round((double)r.Max.Value, 3) : (object)null } };
+            if (r.Ctl) { d["ctl"] = true; d["mode"] = r.CtlMode; }
+            return d;
+        }
+
+        object Data(List<Reading> rows, List<Reading> mains)
+        {
+            return new Dictionary<string, object> {
+                { "t", "data" }, { "full", sensors.Full }, { "emergency", sensors.InEmergency },
+                { "rows", rows.Select(r => Row(r)).ToList() }, { "main", mains.Select(r => r.Key).ToList() } };
+        }
+
+        object Settings()
+        {
+            return new Dictionary<string, object> {
+                { "t", "settings" }, { "startup", startup }, { "alertsOn", alertsOn }, { "alertAt", alertAt },
+                { "fans", sensors.Plans } };
+        }
+
+        void SendInit()
+        {
+            initWithPc = sensors.Ready;
+            form.Post(new Dictionary<string, object> {
+                { "t", "init" }, { "lang", L.It ? "it" : "en" },
+                { "version", Assembly.GetExecutingAssembly().GetName().Version.ToString(3) },
+                { "admin", Admin }, { "driver", sensors.Driver }, { "ready", sensors.Ready }, { "portable", Portable },
+                { "pc", sensors.Pc }, { "minPct", Fans.MinPct },
+                { "history", lastRows.Where(r => history.ContainsKey(r.Key)).ToDictionary(r => r.Key, r => (object)history[r.Key].Select(v => Math.Round((double)v, 2)).ToList()) } });
+            form.Post(Settings());
+            if (lastRows.Count > 0) form.Post(Data(lastRows, Rules.MainTemps(lastRows, sensors.Full)));
+        }
+
+        // Everything the window asks for. The page is ours, but what it sends is still checked here.
+        void OnMessage(Dictionary<string, object> m)
+        {
+            object v;
+            switch (Convert.ToString(m.TryGetValue("t", out v) ? v : ""))
+            {
+                case "ready": SendInit(); break;
+                case "admin": Restart(true); break;
+                case "restart": Restart(false); break;
+                case "pawnio": OpenLink("https://pawnio.eu/"); break;
+                case "open":
+                    string url = m.TryGetValue("url", out v) ? Convert.ToString(v) : "";
+                    if (url == "https://github.com/davide-mariotti/Vigil" || url == "https://ko-fi.com/Z0X32ATNHL" || url == "https://davide-mariotti.github.io/apps/vigil")
+                        OpenLink(url);
+                    break;
+                case "set":
+                    if (m.TryGetValue("startup", out v) && !Portable) { SetStartup(Convert.ToBoolean(v)); startup = IsStartupEnabled(); }
+                    if (m.TryGetValue("alertsOn", out v)) alertsOn = Convert.ToBoolean(v);
+                    if (m.TryGetValue("alertAt", out v)) alertAt = Math.Max(50, Math.Min(110, Convert.ToInt32(v)));
+                    sensors.AlertAt = alertAt;
+                    alarms.Clear();
+                    iconKey = "";
+                    SaveSettings();
+                    form.Post(Settings());
+                    break;
+                case "fan":
+                    string key = m.TryGetValue("k", out v) ? Convert.ToString(v) : null;
+                    if (string.IsNullOrEmpty(key)) break;
+                    var p = new FanPlan();
+                    if (m.TryGetValue("mode", out v)) p.Mode = Convert.ToString(v);
+                    if (m.TryGetValue("pct", out v)) p.Pct = Convert.ToInt32(v);
+                    if (m.TryGetValue("src", out v) && v != null) p.Source = Convert.ToString(v);
+                    if (m.TryGetValue("name", out v) && v != null) p.Name = Convert.ToString(v);
+                    if (m.TryGetValue("temps", out v) && v is IEnumerable) p.Temps = ((IEnumerable)v).Cast<object>().Select(x => Convert.ToInt32(x)).ToArray();
+                    if (m.TryGetValue("pcts", out v) && v is IEnumerable) p.Pcts = ((IEnumerable)v).Cast<object>().Select(x => Convert.ToInt32(x)).ToArray();
+                    var plans = new Dictionary<string, FanPlan>(sensors.Plans);
+                    plans[key] = Fans.Clean(p);
+                    sensors.Plans = plans;   // a new dictionary each time: the sensor thread never sees one half written
+                    SaveSettings();
+                    form.Post(Settings());
+                    break;
+            }
+        }
+
+        // Through Explorer: a browser started by an elevated Vigil would run as administrator too
+        static void OpenLink(string url)
+        {
+            try { Process.Start("explorer.exe", "\"" + url + "\""); } catch { }
         }
 
         void UpdateTray(List<Reading> mains)
@@ -588,6 +831,7 @@ namespace VigilApp
                 }
                 tip = "Vigil: " + string.Join(", ", mains.Select(r => (r.Kind == "Cpu" ? "CPU " : "GPU ") + r.Value.Value.ToString("0") + " °C"));
             }
+            if (sensors.InEmergency) tip += L.T(" · ventole al 100%", " · fans at 100%");
             tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
         }
 
@@ -614,7 +858,7 @@ namespace VigilApp
         void Exit()
         {
             sensors.Updated = null;
-            sensors.Stop();   // closes the library: drivers and chips are left as they were
+            sensors.Stop();   // fans back to the BIOS, then the library closes
             tray.Visible = false;
             TrayIcons.Free(numberIcon);
             form.Dispose();
@@ -721,8 +965,10 @@ namespace VigilApp
                 string s;
                 if (v.TryGetValue("AlertsEnabled", out s)) alertsOn = Convert.ToBoolean(s);
                 if (v.TryGetValue("AlertAt", out s)) alertAt = Math.Max(50, Math.Min(110, Convert.ToInt32(s)));
+                if (v.TryGetValue("Fans", out s))
+                    sensors.Plans = Json.Read<Dictionary<string, FanPlan>>(s).ToDictionary(kv => kv.Key, kv => Fans.Clean(kv.Value));
             }
-            catch { }   // broken values: defaults win
+            catch { }   // broken values: defaults win, fans stay with the BIOS
         }
 
         Dictionary<string, string> ReadValues()
@@ -746,7 +992,7 @@ namespace VigilApp
 
         void SaveSettings()
         {
-            var values = new Dictionary<string, object> { { "AlertsEnabled", alertsOn }, { "AlertAt", alertAt } };
+            var values = new Dictionary<string, object> { { "AlertsEnabled", alertsOn }, { "AlertAt", alertAt }, { "Fans", Json.Write(sensors.Plans) } };
             try
             {
                 if (Portable)

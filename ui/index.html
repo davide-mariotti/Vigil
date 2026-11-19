@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+<title>Vigil</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="glow" aria-hidden="true"></div>
+<header class="top">
+  <div class="brand"><span class="logo" id="logo"></span>Vigil<span class="chip" id="version"></span></div>
+  <span class="spacer"></span>
+  <span class="pill" id="mode"></span>
+  <button class="icon-btn" id="openSettings"></button>
+</header>
+<main class="wrap">
+  <section class="hero">
+    <p class="kicker" id="kicker"></p>
+    <h1 id="title"></h1>
+    <div class="chips" id="pc"></div>
+  </section>
+  <div id="notices"></div>
+  <section class="kpis" id="kpis"></section>
+  <section class="sec" id="fanSec" hidden>
+    <div class="sec-head" id="fanHead"></div>
+    <div class="fan-grid" id="fans"></div>
+    <p class="note" id="fanNote"></p>
+  </section>
+  <section class="sec">
+    <div class="sec-head" id="hwHead"></div>
+    <div class="hw" id="hw"></div>
+  </section>
+  <footer id="footer"></footer>
+</main>
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-modal="true" role="dialog"></aside>
+<script src="icons.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

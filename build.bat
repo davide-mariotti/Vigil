@@ -1,14 +1,17 @@
 @echo off
 rem Builds Vigil.exe with the C# compiler that ships with Windows (.NET Framework 4). Nothing to install.
-rem The libraries in lib\ go inside the exe as resources: one file to download.
+rem The libraries in lib\ and the window's page in ui\ go inside the exe as resources: one file to download.
 cd /d "%~dp0"
 setlocal enabledelayedexpansion
 set LIBS=
 for %%f in (lib\*.dll) do set LIBS=!LIBS! /resource:%%f,%%~nxf
+for %%f in (ui\*.html ui\*.css ui\*.js) do set LIBS=!LIBS! /resource:%%f,ui/%%~nxf
+for %%f in (ui\fonts\*.woff2) do set LIBS=!LIBS! /resource:%%f,ui/fonts/%%~nxf
 echo Compiling Vigil...
 %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /optimize+ /platform:x64 /target:winexe /out:Vigil.exe ^
   /win32icon:icon\vigil.ico /win32manifest:vigil.manifest /resource:icon\vigil.ico,Vigil.ico ^
-  /reference:lib\LibreHardwareMonitorLib.dll /reference:System.Management.dll %LIBS% ^
+  /reference:lib\LibreHardwareMonitorLib.dll /reference:lib\Microsoft.Web.WebView2.Core.dll /reference:lib\Microsoft.Web.WebView2.WinForms.dll ^
+  /reference:System.Management.dll /reference:System.Web.Extensions.dll %LIBS% ^
   Vigil.cs MainForm.cs AssemblyInfo.cs
 if %errorlevel% neq 0 (
     echo Compilation failed.

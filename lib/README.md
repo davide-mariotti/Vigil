@@ -13,6 +13,10 @@
 | System.Buffers.dll | 4.6.1 | MIT | https://github.com/dotnet/maintenance-packages |
 | System.Numerics.Vectors.dll | 4.6.1 | MIT | https://github.com/dotnet/maintenance-packages |
 | System.Runtime.CompilerServices.Unsafe.dll | 6.1.2 | MIT | https://github.com/dotnet/maintenance-packages |
+| Microsoft.Web.WebView2.Core.dll, Microsoft.Web.WebView2.WinForms.dll | 1.0.4314.35 | BSD ([WebView2-LICENSE.txt](WebView2-LICENSE.txt)) | https://www.nuget.org/packages/Microsoft.Web.WebView2 |
+| WebView2Loader.dll (native, x64) | 1.0.4314.35 | BSD ([WebView2-LICENSE.txt](WebView2-LICENSE.txt)) | same package, `runtimes/win-x64/native`. Written to `%LOCALAPPDATA%\Vigil\` at the first start, because Windows can't load a native DLL from memory |
+
+The window's fonts sit in `ui/fonts/`: Geist and Geist Mono (SIL OFL 1.1, [Geist-LICENSE.txt](../ui/fonts/Geist-LICENSE.txt)) and Instrument Serif italic (SIL OFL 1.1, [InstrumentSerif-LICENSE.txt](../ui/fonts/InstrumentSerif-LICENSE.txt)), the latin subsets from Fontsource 5.3.0, the same ones as davide-mariotti.github.io. The icons in `ui/icons.js` are Lucide 1.74.0 (ISC).
 
 The MPL-2.0 text: https://www.mozilla.org/MPL/2.0/
 
