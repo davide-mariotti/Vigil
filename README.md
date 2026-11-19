@@ -13,6 +13,13 @@
   <a href="https://ko-fi.com/Z0X32ATNHL"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Buy me a coffee on Ko-fi"></a>
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/dashboard.webp" width="760" alt="Vigil's window: CPU, graphics card, memory and power draw, each with its last 10 minutes">
+</p>
+<p align="center">
+  <img src="docs/screenshots/fans.webp" width="375" alt="Vigil's fan cards: one on Auto, one on a curve that follows the CPU, one fixed at 45%"> <img src="docs/screenshots/cpu.webp" width="375" alt="The CPU card: temperatures, power, load and clocks of 16 cores and 32 threads as heat maps">
+</p>
+
 ---
 
 ## English
