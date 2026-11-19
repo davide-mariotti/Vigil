@@ -1,0 +1,11 @@
+
+# Valid for a simple C# project without VS solution
+*.obj
+*.pdb
+*.user
+*.suo
+*.cache
+*.exe.config
+
+# Do NOT ignore .exe as requested by user
+# *.exe 
