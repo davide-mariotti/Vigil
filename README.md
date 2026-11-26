@@ -92,7 +92,7 @@ If Vigil caught a dying fan before your CPU did, or simply made your PC quieter,
 
 ### License
 
-[MIT](LICENSE). The libraries and fonts inside the exe keep their own licenses (MPL-2.0, Apache-2.0, BSD, MIT, SIL OFL): the list, with where to get their source, is in [lib/README.md](lib/README.md).
+[MIT](LICENSE). The libraries and fonts inside the exe keep their own licenses (MPL-2.0, Apache-2.0, BSD, MIT, SIL OFL): LibreHardwareMonitorLib and its companions are MPL-2.0, source at github.com/LibreHardwareMonitor/LibreHardwareMonitor; HidSharp and WebView2 licenses are in `lib/`.
 
 ---
 
@@ -166,4 +166,4 @@ Se Vigil ti ha fatto notare una ventola che moriva prima che se ne accorgesse la
 
 ### Licenza
 
-[MIT](LICENSE). Le librerie e i font dentro l'exe hanno le loro licenze (MPL-2.0, Apache-2.0, BSD, MIT, SIL OFL): l'elenco, con dove trovarne i sorgenti, è in [lib/README.md](lib/README.md).
+[MIT](LICENSE). Le librerie e i font dentro l'exe hanno le loro licenze (MPL-2.0, Apache-2.0, BSD, MIT, SIL OFL): LibreHardwareMonitorLib e i suoi compagni sono MPL-2.0, sorgenti su github.com/LibreHardwareMonitor/LibreHardwareMonitor; le licenze di HidSharp e WebView2 sono in `lib/`.

@@ -9,3 +9,5 @@
 
 # Do NOT ignore .exe as requested by user
 # *.exe 
+
+.claude/
